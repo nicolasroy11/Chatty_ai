@@ -1,0 +1,24 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phonebot_api
+    volumes:
+      - ./app:/app/app
+      - ./tenants:/app/tenants
+      - ./runtime_settings.py:/app/runtime_settings.py:ro
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  nginx:
+    image: nginx:alpine
+    container_name: phonebot_nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api

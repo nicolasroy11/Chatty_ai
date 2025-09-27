@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Phone Bot – Local Demo</title>
+<style>
+    body {
+        font: 16px/1.45 system-ui, sans-serif;
+        margin: 2rem auto;
+        max-width: 800px;
+        padding: 0 1rem;
+    }
+
+    #talk {
+        font-size: 18px;
+        padding: .8rem 1.2rem;
+    }
+
+    #log {
+        white-space: pre-wrap;
+        background: #f6f7f9;
+        padding: 1rem;
+        border-radius: 8px;
+        min-height: 220px;
+    }
+</style>
+<h1>AI Phone Bot – Local Voice Demo</h1>
+<p>Click and speak. Uses your browser’s speech recognition & synthesis, and calls the API at <code>/api/*</code>.</p>
+<button id="talk">🎙️ Press & talk</button>
+<pre id="log"></pre>
+
+<script>
+    const logEl = document.getElementById('log');
+    const talkBtn = document.getElementById('talk');
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const synth = window.speechSynthesis;
+    const log = (role, msg) => {
+        const line = `${role ? role + ": " : ""}${msg}`;
+        logEl.textContent += (logEl.textContent ? "\n" : "") + line;
+        logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    let recog = null;
+    if (SR) { recog = new SR(); recog.lang = 'en-US'; recog.interimResults = false; recog.maxAlternatives = 1; }
+    else { log("", "⚠️ This browser lacks SpeechRecognition; it will still speak responses."); }
+
+    const TENANT = "special-events";
+    async function postJSON(path, body) {
+        const r = await fetch(path, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Tenant": TENANT },
+            body: JSON.stringify(body)
+        });
+
+
+        async function callReason(userText) {
+            const body = { messages: [{ role: "user", content: userText }], goal: "Help the caller; return {say, tool?, args?}." };
+            return postJSON("/api/reason", body);
+        }
+
+        async function maybeCallTool(thought) {
+            if (!thought.tool) return null;
+            const t = (thought.tool || "").toLowerCase();
+            const args = thought.args || {};
+            switch (t) {
+                case "quote": return postJSON("/api/quote", args);
+                case "check_availability": return postJSON("/api/check_availability", args);
+                case "create_lead": return postJSON("/api/create_lead", args);
+                case "book": return postJSON("/api/book", args);
+                default: return null;
+            }
+        }
+
+        function speak(text) {
+            if (!synth) return;
+            const u = new SpeechSynthesisUtterance(text);
+            u.rate = 1.0; u.pitch = 1.0;
+            synth.cancel();
+            synth.speak(u);
+        }
+
+        async function handleUserInput(user) {
+            log("👤", user);
+            try {
+                const thought = await callReason(user); // { say, tool?, args? }
+                log("🤖", thought.say); speak(thought.say);
+                const toolRes = await maybeCallTool(thought);
+                if (toolRes) {
+                    if (toolRes.total !== undefined) {
+                        const sum = `Subtotal ${toolRes.subtotal.toFixed(2)}, delivery ${toolRes.delivery_fee.toFixed(2)}, tax ${toolRes.tax.toFixed(2)}. Total ${toolRes.total.toFixed(2)}.`;
+                        log("🧮 quote", JSON.stringify(toolRes, null, 2));
+                        speak(`Here's your quote. ${sum}`);
+                    } else if (toolRes.available !== undefined) {
+                        const msg = toolRes.available ? "Everything is available." : `Some items are short: ${toolRes.shortages.map(s => s.id).join(", ")}`;
+                        log("📦 availability", JSON.stringify(toolRes, null, 2));
+                        speak(msg);
+                    } else if (toolRes.lead_id) { log("📝 lead", JSON.stringify(toolRes, null, 2)); speak("Lead created. We’ll follow up."); }
+                    else if (toolRes.order_id) { log("✅ order", JSON.stringify(toolRes, null, 2)); speak("You're booked. See you at your event!"); }
+                    else { log("🛠️ tool", JSON.stringify(toolRes, null, 2)); }
+                }
+            } catch (e) { log("⚠️", String(e)); speak("Sorry, I hit a snag."); }
+        }
+
+        if (recog) {
+            recog.onstart = () => talkBtn.textContent = "🛑 Stop";
+            recog.onend = () => talkBtn.textContent = "🎙️ Press & talk";
+            recog.onerror = (e) => log("SR error", e.error || "unknown");
+            recog.onresult = (e) => handleUserInput(e.results[0][0].transcript);
+            talkBtn.onclick = () => { if (synth) synth.cancel(); try { recog.abort(); } catch { } recog.start(); log("", "🎧 listening…"); };
+        } else {
+            talkBtn.onclick = async () => { if (synth) synth.cancel(); const user = prompt("Type your message"); if (user) await handleUserInput(user); };
+        }
+    }
+</script>
+
+</html>

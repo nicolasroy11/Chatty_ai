@@ -1,0 +1,23 @@
+business:
+  slug: "example-co"
+  name: "Example Event Rentals"
+  hours: "Mon–Sat 9am–6pm"
+  service_area: ["913**"]
+  warehouse_zip: "91306"
+  tax_rate: 0.095
+  min_order_subtotal: 100.0
+telephony:
+  did: ["+15551234567"]
+pricing:
+  delivery:
+    base_fee: 25
+    per_mile: 2
+  weekend_multiplier: 1.15
+  setup_minutes_per_item: 5
+  staff_hourly: 30
+  discounts:
+    weekday_pct: 0.05
+inventory:
+  items:
+    - {id: "550e8400-e29b-41d4-a716-446655440000", name: "Resin Folding Chair (White)", daily_price: 3.50, qty: 800}
+  blocks: []
