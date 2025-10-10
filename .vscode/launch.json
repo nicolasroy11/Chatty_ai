@@ -12,13 +12,15 @@
         "--port", "8000",
         "--reload"
       ],
-      "jinja": true,
-      "env": {
-        "OLLAMA_URL": "http://localhost:11434",
-        "OLLAMA_MODEL": "llama3:instruct",
-        "TENANTS_DIR": "${workspaceFolder}/tenants",
-        "TENANT_HEADER": "X-Tenant"
-      }
+    },
+    {
+      "name": "Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-v", "app/tests"],
+      "console": "integratedTerminal",
+      "justMyCode": false
     }
   ]
 }

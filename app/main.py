@@ -2,8 +2,17 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 from typing import List
-import os, json, uuid
+import os, json, uuid, re
 import runtime_settings as rt
+from collections import OrderedDict
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# voice imports
+import asyncio
+import edge_tts
+from playsound import playsound
+
 
 from openai import OpenAI
 
@@ -23,9 +32,11 @@ TENANT_HEADER = rt.TENANT_HEADER
 TENANT_FROM_DID = rt.TENANT_FROM_DID
 ADMIN_API_KEY = rt.ADMIN_API_KEY
 
+OPENING_GREETING = "Hi, you've reached Special Events Rental, who am I speaking with?"
+
 # --- Init ---
 tenant_mgr = TenantManager(tenants_dir=TENANTS_DIR)
-app = FastAPI(title="Phone Bot Tools API (Multi-tenant)", version="0.6.0")
+app = FastAPI(title="Phone Bot Tools API (Multi-tenant)", version="0.8.0")
 
 public_dir = os.path.join(os.path.dirname(__file__), "..", "public")
 if os.path.isdir(public_dir):
@@ -33,16 +44,20 @@ if os.path.isdir(public_dir):
 
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
-
-# ---------- helpers ----------
+# ---------- Reasoning helpers ----------
 def _build_reason_messages(eng: PricingEngine, req: ReasonRequest) -> list[dict]:
     biz = eng.cfg.get("business", {})
+    catalog_items = [v.name for v in eng.catalog.values()]
     sys = (
         "You are the brain of a phone sales agent for an event-rental business. "
         f"Business: {biz.get('name','N/A')}; Hours: {biz.get('hours','N/A')}; "
         f"Service area prefixes: {biz.get('service_area',[])}. "
         "Return STRICT JSON: {say: string, tool?: string, args?: object}. "
-        "Tools: quote, check_availability, create_lead, book. Be concise."
+        "Tools: quote, check_availability, create_lead, book. Be concise. "
+        "If the customer requests something ambiguous (like 'chairs' or 'tables'), "
+        f"ask them to clarify by choosing from available options: {catalog_items}. "
+        "Never assume the type if multiple catalog items could apply. "
+        "Speak in a natural receptionist style, like a real conversation."
     )
     return (
         [{"role": "system", "content": sys},
@@ -50,11 +65,9 @@ def _build_reason_messages(eng: PricingEngine, req: ReasonRequest) -> list[dict]
         + [m.model_dump() for m in req.messages]
     )
 
+
 def _reason_with_openai(messages: list[dict]) -> Thought:
-    # Uses your global OPENAI_… settings already loaded
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    r = client.chat.completions.create(
+    r = oai.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         response_format={
@@ -73,27 +86,24 @@ def _reason_with_openai(messages: list[dict]) -> Thought:
                 }
             }
         },
-        max_tokens=150,
+        max_tokens=200,
     )
-    import json as _json
-    return Thought(**_json.loads(r.choices[0].message.content))
+    return Thought(**json.loads(r.choices[0].message.content))
 
-# ------- Tool chaining helpers ------- TODO: refactor for cleaner design
+async def _speak(text: str, voice: str = "en-US-JennyNeural"):
+    """Generate and play voice for the given text locally using Edge-TTS."""
+    out_file = "tmp_voice.mp3"
+    communicate = edge_tts.Communicate(text, voice, rate="+5%", pitch="+10Hz")
+    await communicate.save(out_file)
+    playsound(out_file)
+    os.remove(out_file)
 
-import re
 
+# ---------- Catalog normalization ----------
 def _canon(s: str) -> list[str]:
-    """
-    Canonicalize a name into tokens:
-    - lowercase
-    - remove punctuation
-    - split to words
-    - naive singularize (drop trailing 's')
-    """
     s = s.lower()
-    s = re.sub(r"[^\w\s]", " ", s)   # kill punctuation/quotes/() etc.
+    s = re.sub(r"[^\w\s]", " ", s)
     toks = [t for t in s.split() if t]
-    # naive singularization
     out = []
     for t in toks:
         if t.endswith("s") and len(t) > 3:
@@ -102,15 +112,6 @@ def _canon(s: str) -> list[str]:
     return out
 
 def _normalize_items(eng: PricingEngine, args: dict) -> list[dict]:
-    """
-    Accepts either:
-      - {"item": "Resin Folding Chair (White)", "quantity": 50}
-      - {"items": [{"name":"white resin chairs","qty": 50}, {"id":"chair_resin", "qty": 10}]}
-      - {"item": "chair_resin", "quantity": 50}
-    Returns: [{"id": "<catalog_id>", "qty": int}, ...]
-    Uses fuzzy matching against catalog names if id is not given.
-    """
-    # collect incoming items
     items_in = []
     if "items" in args and isinstance(args["items"], list):
         items_in = args["items"]
@@ -119,21 +120,15 @@ def _normalize_items(eng: PricingEngine, args: dict) -> list[dict]:
     else:
         return []
 
-    # build lookup structures
     name_to_id_exact = {v.name.lower(): k for k, v in eng.catalog.items()}
-    # precompute canonical tokens for each catalog item
-    catalog_tokens = {}
-    for k, v in eng.catalog.items():
-        catalog_tokens[k] = set(_canon(v.name))
+    catalog_tokens = {k: set(_canon(v.name)) for k, v in eng.catalog.items()}
 
     out = []
     for it in items_in:
-        # 1) direct id pass-through
         if it.get("id") and it["id"] in eng.catalog:
             out.append({"id": it["id"], "qty": int(it.get("qty", it.get("quantity", 1)))})
             continue
 
-        # 2) exact name match
         nm = (it.get("name") or it.get("item") or "").strip()
         if nm:
             iid = name_to_id_exact.get(nm.lower())
@@ -141,55 +136,32 @@ def _normalize_items(eng: PricingEngine, args: dict) -> list[dict]:
                 out.append({"id": iid, "qty": int(it.get("qty", it.get("quantity", 1)))})
                 continue
 
-            # 3) fuzzy token overlap match
             qtokens = set(_canon(nm))
-            # score by token overlap size; prefer larger overlaps and longer catalog names
-            best_id = None
-            best_score = 0
+            best_id, best_score = None, 0
             for cid, ctoks in catalog_tokens.items():
                 score = len(qtokens & ctoks)
                 if score > best_score:
                     best_score = score
                     best_id = cid
-
-            # require at least 2 overlapping tokens to avoid silly matches
             if best_id and best_score >= 2:
                 out.append({"id": best_id, "qty": int(it.get("qty", it.get("quantity", 1)))})
                 continue
 
-        # 4) last-chance: if the provided string is actually a catalog id
         if nm and nm in eng.catalog:
             out.append({"id": nm, "qty": int(it.get("qty", it.get("quantity", 1)))})
             continue
 
-        # Could not resolve
-        # Build a few suggestions (top 3 by overlap)
-        if nm:
-            qtokens = set(_canon(nm))
-            scored = sorted(
-                [(cid, len(qtokens & ctoks)) for cid, ctoks in catalog_tokens.items()],
-                key=lambda x: x[1],
-                reverse=True,
-            )[:3]
-            suggestions = [{"id": cid, "name": eng.catalog[cid].name} for cid, sc in scored if sc > 0]
-        else:
-            suggestions = []
-        raise HTTPException(400, f"Unknown item in request: {it}. Suggestions: {suggestions}")
+        raise HTTPException(400, f"Unknown item in request: {it}")
 
     return out
-
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 def _normalize_zip(args: dict) -> str | None:
     z = args.get("zip") or args.get("postal") or args.get("area") \
         or args.get("location") or args.get("location_prefix")
     if not z: 
         return None
-    z = str(z).strip()
-    # keep first 5 digits if a ZIP+4 or prefix was provided
-    digits = "".join(ch for ch in z if ch.isdigit())
-    return digits[:5] if digits else z
+    digits = "".join(ch for ch in str(z) if ch.isdigit())
+    return digits[:5] if digits else str(z)
 
 _WEEKDAYS = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
 
@@ -208,50 +180,20 @@ def _normalize_date(ds: str | None, tz="America/Los_Angeles") -> str | None:
         w = s.split(" ", 1)[1]
         if w in _WEEKDAYS:
             return _next_weekday_iso(_WEEKDAYS[w], tz=tz)
-    # already ISO?
     try:
         datetime.fromisoformat(s)
         return s
     except Exception:
-        return s  # leave as-is if we can’t parse
+        return s
 
-
-def _run_tool(eng: PricingEngine, tool: str, args: dict) -> dict:
-    tool = (tool or "").strip()
-    if not tool:
+def _run_tool(eng: PricingEngine, tool: str | None, args: dict) -> dict:
+    # Normalize nulls
+    if not tool or str(tool).lower() == "null":
         return {}
 
+    tool = tool.strip()
+
     # ---- check_availability ----
-    if tool == "check_availability":
-        date = args.get("date") or args.get("delivery_date")
-        if not date:
-            raise HTTPException(400, "check_availability requires 'date'")
-        items = _normalize_items(eng, args)
-        req = [(x["id"], x["qty"]) for x in items]
-        shortages = eng.check_availability(date, req)
-        return {
-            "available": len(shortages) == 0,
-            "shortages": shortages,
-            "substitutions": [],
-        }
-
-    # ---- create_lead ----
-    if tool == "create_lead":
-        name = args.get("name") or "Caller"
-        phone = args.get("phone") or args.get("caller") or ""
-        email = args.get("email")
-        quote_id = args.get("quote_id")
-        lead = repo.create_lead(name, phone, email, quote_id)
-        return {"lead_id": lead.lead_id}
-
-    # ---- book ----
-    if tool == "book":
-        quote_id = args.get("quote_id") or ""
-        payment_token = args.get("payment_token") or "demo"
-        order = repo.create_order(quote_id)
-        return {"order_id": order.order_id, "payment_token_used": payment_token}
-    
-    # ----- check_availability -----
     if tool == "check_availability":
         date = _normalize_date(args.get("date") or args.get("delivery_date"))
         if not date:
@@ -261,7 +203,7 @@ def _run_tool(eng: PricingEngine, tool: str, args: dict) -> dict:
         shortages = eng.check_availability(date, req)
         return {"available": len(shortages) == 0, "shortages": shortages, "substitutions": []}
 
-    # ----- quote -----
+    # ---- quote ----
     if tool == "quote":
         date = _normalize_date(args.get("date") or args.get("delivery_date"))
         zip_code = _normalize_zip(args)
@@ -275,9 +217,24 @@ def _run_tool(eng: PricingEngine, tool: str, args: dict) -> dict:
             priced["note"] = "Some items are short; consider substitutions."
         return priced
 
+    # ---- create_lead ----
+    if tool == "create_lead":
+        lead = repo.create_lead(
+            args.get("name") or "Caller",
+            args.get("phone") or args.get("caller") or "",
+            args.get("email"),
+            args.get("quote_id"),
+        )
+        return {"lead_id": lead.lead_id}
+
+    # ---- book ----
+    if tool == "book":
+        order = repo.create_order(args.get("quote_id") or "")
+        return {"order_id": order.order_id}
+
     raise HTTPException(400, f"Unknown tool '{tool}'")
 
-
+# ---------- Endpoints ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "tenants": tenant_mgr.list_tenants()}
@@ -288,82 +245,120 @@ async def get_engine(request: Request) -> PricingEngine:
         raise HTTPException(400, "Missing tenant. Provide X-Tenant header or X-Caller-DID.")
     return tenant_mgr.get_engine(t_name)
 
-# --------- Reason (OpenAI) ----------
-@app.post("/reason", response_model=Thought)
-async def reason(req: ReasonRequest, request: Request):
+# --- Conversational Entry Point ---
+@app.post("/dialog")
+async def dialog(req: ReasonRequest, request: Request):
+    """
+    Main conversational loop:
+    - If no messages yet → greet caller.
+    - Otherwise → reason over messages, possibly run tools, return reply.
+    """
     eng: PricingEngine = await get_engine(request)
+
+    # ---- 1️⃣ Greeting ----
+    if not req.messages:
+        say = OPENING_GREETING
+        if request.query_params.get("local_voice_test") == "True":
+            try:
+                asyncio.create_task(_speak(say))
+            except Exception as e:
+                print(f"[VOICE] synthesis failed: {e}")
+        return {
+            "say": say,
+            "tool": None,
+            "args": None,
+            "tool_result": None,
+        }
+
+    # ---- 2️⃣ Reasoning phase ----
     messages = _build_reason_messages(eng, req)
     try:
-        return _reason_with_openai(messages)
+        # handle both sync and async mocks
+        maybe_thought = _reason_with_openai(messages)
+        if asyncio.iscoroutine(maybe_thought):
+            thought = await maybe_thought
+        else:
+            thought = maybe_thought
     except Exception as e:
-        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
-    
-@app.post("/reason_and_act")
-async def reason_and_act(req: ReasonRequest, request: Request):
-    eng: PricingEngine = await get_engine(request)
-    messages = _build_reason_messages(eng, req)
+        # fallback path: still email, then return 500
+        caller_number = request.headers.get("X-Caller-Number", "unknown")
+        subject = "Incomplete lead (reasoning error)"
+        body = f"Reasoning failed for caller {caller_number}.\nError: {e}"
+        try:
+            send_lead_email(subject, body)
+        except Exception as email_err:
+            print(f"[EMAIL STUB ERROR] {email_err}")
 
-    try:
-        thought = _reason_with_openai(messages)
-    except Exception as e:
-        return JSONResponse({"error": f"reason error: {e}"}, status_code=500)
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"reason error: {str(e)}"}
+        )
 
+    # ---- 3️⃣ Tool execution ----
+    tool = thought.tool if thought.tool and str(thought.tool).lower() != "null" else None
     tool_result = None
-    if thought.tool:
-        tool_result = _run_tool(eng, thought.tool, thought.args or {})
+    if tool:
+        try:
+            tool_result = _run_tool(eng, tool, thought.args or {})
+        except Exception as e:
+            tool_result = {"error": str(e)}
 
-    # If the model asked to check availability and it's available,
-    # immediately follow with a quote using the same args.
+    # ---- 4️⃣ Follow-up logic ----
     followup = None
-    if thought.tool == "check_availability" and tool_result and tool_result.get("available"):
+    if tool == "check_availability" and tool_result and tool_result.get("available"):
         try:
             followup = _run_tool(eng, "quote", thought.args or {})
         except Exception:
-            pass  # don’t fail the request; just skip follow-up
+            pass
 
+    # ---- 5️⃣ Lead email ----
+    if tool == "create_lead" and tool_result:
+        args = thought.args or {}
+        subject = f"New Lead: {args.get('name','Unknown')} ({args.get('date','N/A')})"
+        body = json.dumps(args, indent=2)
+        try:
+            send_lead_email(subject, body)
+        except Exception as e:
+            print(f"[EMAIL ERROR] Lead email failed: {e}")
+
+    # ---- 6️⃣ Voice synthesis ----
+    if request.query_params.get("local_voice_test") == "True":
+        try:
+            asyncio.create_task(_speak(thought.say))
+        except Exception as e:
+            print(f"[VOICE] synthesis failed: {e}")
+
+    # ---- 7️⃣ Return structured response ----
     return {
         "say": thought.say,
-        "tool": thought.tool,
+        "tool": tool,
         "args": thought.args,
         "tool_result": tool_result,
         "followup_quote": followup,
     }
 
 
+# ---------- Lead notification ----------
+def send_lead_email(subject: str, body: str):
+    """
+    Temporary stub for testing / dev.
+    Later this can send via SMTP, SES, SendGrid, etc.
+    """
+    print(f"[LEAD EMAIL]\nSubject: {subject}\nBody:\n{body}\n")
+    return True
 
-# --------- Availability ----------
+# --------- Availability, Quote, Leads, Admin ---------
 @app.post("/check_availability", response_model=AvailabilityOut)
 async def check_availability(inp: AvailabilityIn, request: Request):
     eng = await get_engine(request)
-    req: List[tuple[uuid.UUID, int]] = []
-    for it in inp.items:
-        iid = it.id
-        if not iid and it.name:
-            for k, v in eng.catalog.items():
-                if v.name.lower() == it.name.lower():
-                    iid = k
-                    break
-        if not iid:
-            raise HTTPException(400, f"Unknown item: {it}")
-        req.append((iid, it.qty))
+    req: List[tuple[uuid.UUID, int]] = [(it.id, it.qty) for it in inp.items]
     shortages = eng.check_availability(inp.date, req)
     return AvailabilityOut(available=(len(shortages) == 0), shortages=shortages, substitutions=[])
 
-# --------- Quote ----------
 @app.post("/quote", response_model=MoneyOut)
 async def quote(inp: QuoteIn, request: Request):
     eng = await get_engine(request)
-    req: List[tuple[uuid.UUID, int]] = []
-    for it in inp.items:
-        iid = it.id
-        if not iid and it.name:
-            for k, v in eng.catalog.items():
-                if v.name.lower() == it.name.lower():
-                    iid = k
-                    break
-        if not iid:
-            raise HTTPException(400, f"Unknown item: {it}")
-        req.append((iid, it.qty))
+    req: List[tuple[uuid.UUID, int]] = [(it.id, it.qty) for it in inp.items]
     shortages = eng.check_availability(inp.date, req)
     priced = eng.price(inp.date, inp.zip, req)
     if shortages:
@@ -371,7 +366,6 @@ async def quote(inp: QuoteIn, request: Request):
         return JSONResponse(status_code=206, content=priced)
     return priced
 
-# --------- Lead & Booking ----------
 @app.post("/create_lead", response_model=LeadOut)
 async def create_lead(inp: LeadIn):
     lead = repo.create_lead(inp.name, inp.phone, inp.email, inp.quote_id)
@@ -382,7 +376,6 @@ async def book(inp: BookIn):
     order = repo.create_order(inp.quote_id)
     return BookOut(order_id=order.order_id)
 
-# --------- Admin: Inventory CRUD ----------
 @app.get("/admin/inventory", response_model=List[ItemDef])
 async def admin_list_inventory(request: Request):
     if request.headers.get("X-Admin-Key", "") != ADMIN_API_KEY:

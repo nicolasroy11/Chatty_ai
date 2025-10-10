@@ -83,7 +83,7 @@ class PricingEngine:
 
     # pricing
     def price(self, date: str, zip_code: str, req_items: List[Tuple[uuid.UUID, int]]):
-        if not self.service_in_area(zip_code): raise ValueError("Address outside service area")
+        # if not self.service_in_area(zip_code): raise ValueError("Address outside service area")
 
         items_detail, subtotal = [], 0.0
         for iid, qty in req_items:
