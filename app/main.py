@@ -245,6 +245,23 @@ async def get_engine(request: Request) -> PricingEngine:
         raise HTTPException(400, "Missing tenant. Provide X-Tenant header or X-Caller-DID.")
     return tenant_mgr.get_engine(t_name)
 
+from fastapi import Form
+from fastapi.responses import Response
+
+@app.post("/twilio/voice")
+async def twilio_voice(From: str = Form(...), To: str = Form(...)):
+    """
+    Entry point for incoming Twilio calls.
+    Just responds with a simple greeting for now.
+    """
+    twiml = """
+    <Response>
+      <Say voice="Polly.Joanna">Hi! You’ve reached Special Events Rental. This is a test call.</Say>
+    </Response>
+    """
+    return Response(content=twiml.strip(), media_type="application/xml")
+
+
 # --- Conversational Entry Point ---
 @app.post("/dialog")
 async def dialog(req: ReasonRequest, request: Request):
@@ -412,3 +429,14 @@ async def admin_delete_item(item_id: uuid.UUID, request: Request):
     eng.delete_item(item_id)
     eng.save()
     return {"ok": True, "deleted": str(item_id)}
+
+
+############################################# We start ngrok automatically for Twilio testing #############################################
+from pyngrok import ngrok, conf
+import os
+
+rt.NGROK_AUTHTOKEN
+conf.get_default().auth_token = rt.NGROK_AUTHTOKEN
+public_url = ngrok.connect(8000).public_url
+print(f"[NGROK] Public URL: {public_url}")
+print("Set this as your Twilio webhook:\n" f"  {public_url}/twilio/voice\n")
