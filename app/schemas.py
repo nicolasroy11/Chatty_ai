@@ -1,31 +1,46 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
+# app/schemas.py
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Dict, Any
 import uuid
+from app.classes.turn import Turn
 
-class Turn(BaseModel):
-    role: Literal["system","user","assistant"]
-    content: str
 
-class ReasonRequest(BaseModel):
+# ---------- Core Reasoning Schemas ----------
+
+@dataclass
+class ReasonRequest:
     messages: List[Turn]
-    goal: str = Field("Produce a brief, helpful reply and any next tool as JSON.")
+    goal: str = "Produce a brief, helpful reply and any next tool as JSON."
 
-class Thought(BaseModel):
+
+@dataclass
+class Thought:
     say: str
     tool: Optional[str] = None
     args: Optional[Dict[str, Any]] = None
 
-class QuoteItemIn(BaseModel):
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ---------- Quote & Pricing ----------
+
+@dataclass
+class QuoteItemIn:
     id: Optional[uuid.UUID] = None
     name: Optional[str] = None
     qty: int = 1
 
-class QuoteIn(BaseModel):
+
+@dataclass
+class QuoteIn:
     date: str
     zip: str
     items: List[QuoteItemIn]
 
-class MoneyOut(BaseModel):
+
+@dataclass
+class MoneyOut:
     line_items: List[Dict[str, Any]]
     subtotal: float
     delivery_fee: float
@@ -34,44 +49,69 @@ class MoneyOut(BaseModel):
     tax: float
     total: float
 
-class AvailabilityIn(BaseModel):
+
+# ---------- Availability ----------
+
+@dataclass
+class AvailabilityIn:
     date: str
     items: List[QuoteItemIn]
 
-class AvailabilityOut(BaseModel):
-    available: bool
-    shortages: List[Dict[str, Any]] = []
-    substitutions: List[Dict[str, Any]] = []
 
-class LeadIn(BaseModel):
+@dataclass
+class AvailabilityOut:
+    available: bool
+    shortages: List[Dict[str, Any]] = field(default_factory=list)
+    substitutions: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# ---------- Lead Management ----------
+
+@dataclass
+class LeadIn:
     name: str
     phone: str
     email: Optional[str] = None
     quote_id: Optional[uuid.UUID] = None
 
-class LeadOut(BaseModel):
+
+@dataclass
+class LeadOut:
     lead_id: uuid.UUID
 
-class BookIn(BaseModel):
+
+# ---------- Booking ----------
+
+@dataclass
+class BookIn:
     quote_id: uuid.UUID
     payment_token: str
 
-class BookOut(BaseModel):
+
+@dataclass
+class BookOut:
     order_id: uuid.UUID
 
-# Admin catalog models
-class ItemDef(BaseModel):
+
+# ---------- Admin / Catalog ----------
+
+@dataclass
+class ItemDef:
     id: uuid.UUID
     name: str
     daily_price: float
     qty: int = 0
 
-class ItemCreate(BaseModel):
+
+@dataclass
+class ItemCreate:
     name: str
     daily_price: float
     qty: int = 0
 
-class ItemUpdate(BaseModel):
+
+@dataclass
+class ItemUpdate:
     name: Optional[str] = None
     daily_price: Optional[float] = None
     qty: Optional[int] = None
