@@ -12,8 +12,12 @@ from app.repo import repo
 from app.tenancy import TenantManager, resolve_tenant_name
 from app.schemas import (ReasonRequest, Thought, LeadIn, LeadOut)
 
+from app.utils import tts
+from app.utils.tts import synthesize_speech
 import runtime_settings as rt
 from openai import OpenAI
+
+from fastapi.staticfiles import StaticFiles
 
 
 # ---------------- Environment ----------------
@@ -29,6 +33,7 @@ tenant_mgr = TenantManager(tenants_dir=TENANTS_DIR)
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(title="Phone Bot Tools API (Multi-tenant)", version="1.0.0")
+app.mount("/audio", StaticFiles(directory=tts.AUDIO_DIR), name="audio")
 
 public_dir = os.path.join(os.path.dirname(__file__), "..", "public")
 if os.path.isdir(public_dir):
@@ -72,26 +77,54 @@ async def twilio_voice(From: str = Form(...), To: str = Form(...), CallSid: str 
 
 
 @app.post("/twilio/handle_speech")
-async def twilio_handle_speech(SpeechResult: str = Form(None), From: str = Form(None), CallSid: str = Form(None)):
-    print(f"Caller {From} said: {SpeechResult}")
+async def twilio_handle_speech(SpeechResult: str = Form(None), From: str = Form(None), CallSid: str = Form(None),):
+    """Handle speech input from Twilio, advance workflow, and respond with neural voice playback."""
+    user_text = (SpeechResult or "").strip()
+    print(f"Caller {From} said: {user_text}")
 
+    # retrieve or create a session for this call
     session = get_or_create_session(CallSid, From)
-    session.add_message("user", SpeechResult or "")
+    session.add_message("user", user_text)
 
+    # process step via workflow
     workflow = TenantWorkflow()
-    say_text = workflow.handle_step(session, SpeechResult or "")
+    say_text = workflow.handle_step(session, user_text)
 
+    # save assistant reply
     session.add_message("assistant", say_text)
     session.say = say_text
 
-    twiml = f"""
-    <Response>
-      <Say voice="Polly.Matthew">{say_text}</Say>
-      {'<Hangup/>' if workflow.is_complete(session) else '<Gather input="speech" action="/twilio/handle_speech" speechTimeout="auto" />'}
-    </Response>
-    """.strip()
+    # generate neural audio using OpenAI TTS
+    audio_filename = f"{CallSid}_{len(session.messages)}"
+    audio_path = synthesize_speech(say_text, audio_filename)
+    audio_basename = os.path.basename(audio_path)
+    audio_url = f"{rt.ENV.URL}/audio/{audio_basename}"
 
-    return Response(content=twiml, media_type="application/xml")
+    # build TwiML dynamically
+    response_body = build_twiml_response(audio_url, workflow.is_complete(session))
+    return Response(content=response_body, media_type="application/xml")
+
+
+def build_twiml_response(audio_url: str, call_complete: bool) -> str:
+    """Return properly formatted TwiML for either ongoing or final response."""
+    if call_complete:
+        # ✅ Final message before hangup
+        return f"""
+        <Response>
+            <Play>{audio_url}</Play>
+            <Hangup/>
+        </Response>
+        """.strip()
+    else:
+        # 🔁 Continue gathering user input
+        return f"""
+        <Response>
+            <Play>{audio_url}</Play>
+            <Gather input="speech"
+                    action="{rt.ENV.URL}/twilio/handle_speech"
+                    speechTimeout="auto" />
+        </Response>
+        """.strip()
 
 
 @app.post("/twilio/hangup")
