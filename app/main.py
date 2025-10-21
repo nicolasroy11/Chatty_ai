@@ -108,7 +108,7 @@ async def twilio_handle_speech(SpeechResult: str = Form(None), From: str = Form(
 def build_twiml_response(audio_url: str, call_complete: bool) -> str:
     """Return properly formatted TwiML for either ongoing or final response."""
     if call_complete:
-        # ✅ Final message before hangup
+        # final message before hangup
         return f"""
         <Response>
             <Play>{audio_url}</Play>
@@ -116,7 +116,7 @@ def build_twiml_response(audio_url: str, call_complete: bool) -> str:
         </Response>
         """.strip()
     else:
-        # 🔁 Continue gathering user input
+        # continue gathering user input
         return f"""
         <Response>
             <Play>{audio_url}</Play>
