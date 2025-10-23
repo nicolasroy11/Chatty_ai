@@ -3,7 +3,6 @@ from fastapi.responses import Response
 from starlette.staticfiles import StaticFiles
 from typing import List
 import os, json
-
 from app.classes.session import SessionState
 from app.classes.turn import Turn
 from app.tenant_workflow import TenantWorkflow
@@ -11,14 +10,14 @@ from app.pricing import PricingEngine
 from app.repo import repo
 from app.tenancy import TenantManager, resolve_tenant_name
 from app.schemas import (ReasonRequest, Thought, LeadIn, LeadOut)
-
 from app.utils import tts
 from app.utils.tts import synthesize_speech
 import runtime_settings as rt
 from openai import OpenAI
+from fastapi import WebSocket
 
-from fastapi.staticfiles import StaticFiles
 
+PREPARED_AUDIO_URL: dict[str, str] = {}  # CallSid -> audio URL ready to play
 
 # ---------------- Environment ----------------
 OPENAI_API_KEY = rt.OPENAI_API_KEY
@@ -60,49 +59,63 @@ async def get_engine(request: Request) -> PricingEngine:
 
 
 # ---------------- Twilio Voice ----------------
+
+@app.websocket("/test_ws")
+async def test_ws(ws: WebSocket):
+    await ws.accept()
+    print("ws connected")
+    while True:
+        msg = await ws.receive_text()
+        print("msg:", msg)
+        await ws.send_text("pong")
+
+
 @app.post("/twilio/voice")
 async def twilio_voice(From: str = Form(...), To: str = Form(...), CallSid: str = Form(...)):
     print(f"Incoming call from {From}, CallSid={CallSid}")
     get_or_create_session(CallSid, From)
 
     handle_url = f"{rt.ENV.URL}/twilio/handle_speech"
+    ws_url = rt.ENV.URL.replace("https", "wss").replace("http", "ws") + "/twilio/stream"
 
     twiml = f"""
-    <Response>
-      <Say voice="Polly.Matthew">{rt.TENANT.OPENING_GREETING}</Say>
-      <Gather input="speech" action="{handle_url}" speechTimeout="auto" />
-    </Response>
-    """
+        <Response>
+        <Start>
+            <Stream url="{ws_url}" track="inbound_audio"/>
+        </Start>
+        <Say voice="Polly.Matthew">{rt.TENANT.OPENING_GREETING}</Say>
+        <Gather input="speech" action="{handle_url}" speechTimeout="auto" />
+        </Response>
+        """
+
     return Response(content=twiml.strip(), media_type="application/xml")
 
 
 @app.post("/twilio/handle_speech")
-async def twilio_handle_speech(SpeechResult: str = Form(None), From: str = Form(None), CallSid: str = Form(None),):
-    """Handle speech input from Twilio, advance workflow, and respond with neural voice playback."""
+async def twilio_handle_speech(SpeechResult: str = Form(None), From: str = Form(None), CallSid: str = Form(None)):
     user_text = (SpeechResult or "").strip()
     print(f"Caller {From} said: {user_text}")
 
-    # retrieve or create a session for this call
     session = get_or_create_session(CallSid, From)
-    session.add_message("user", user_text)
 
-    # process step via workflow
+    # If Media Streams prepped an answer/audio, play it instantly.
+    pre = PREPARED_AUDIO_URL.pop(CallSid, None)
+    if pre:
+        # Decide if conversation continues or not
+        wf = TenantWorkflow()
+        done = wf.is_complete(session)
+        return Response(content=build_twiml_response(pre, done), media_type="application/xml")
+
+    # Fallback to current (non-streaming) path
+    session.add_message("user", user_text)
     workflow = TenantWorkflow()
     say_text = workflow.handle_step(session, user_text)
-
-    # save assistant reply
     session.add_message("assistant", say_text)
     session.say = say_text
-
-    # generate neural audio using OpenAI TTS
     audio_filename = f"{CallSid}_{len(session.messages)}"
     audio_path = synthesize_speech(say_text, audio_filename)
-    audio_basename = os.path.basename(audio_path)
-    audio_url = f"{rt.ENV.URL}/audio/{audio_basename}"
-
-    # build TwiML dynamically
-    response_body = build_twiml_response(audio_url, workflow.is_complete(session))
-    return Response(content=response_body, media_type="application/xml")
+    audio_url = f"{rt.ENV.URL}/audio/{os.path.basename(audio_path)}"
+    return Response(content=build_twiml_response(audio_url, workflow.is_complete(session)), media_type="application/xml")
 
 
 def build_twiml_response(audio_url: str, call_complete: bool) -> str:
@@ -125,6 +138,55 @@ def build_twiml_response(audio_url: str, call_complete: bool) -> str:
                     speechTimeout="auto" />
         </Response>
         """.strip()
+
+
+@app.websocket("/twilio/stream")
+async def twilio_stream(websocket: WebSocket):
+    await websocket.accept()
+    params = dict(websocket.query_params)
+    call_id = params.get("CallSid", "local")
+    caller = params.get("From", "")
+    session = get_or_create_session(call_id, caller)
+
+    # TODO: replace with local ASR (whisper.cpp?)
+    partial_text = []
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+
+            et = data.get("event")
+            if et == "start":
+                continue
+            if et == "media":
+                # feed audio to ASR
+                # chunk = base64.b64decode(data["media"]["payload"])
+                # asr.feed(chunk)
+                continue
+            if et == "mark":
+                continue
+            if et == "stop":
+                # End this streaming session
+                break
+    except Exception:
+        pass
+    finally:
+        # final_text = asr.final_result()
+        final_text = " " .join(partial_text).strip()  # placeholder if buffering partials
+        if final_text:
+            # Pre-run normal workflow and synth so it’s ready for /handle_speech
+            wf = TenantWorkflow()
+            say_text = wf.handle_step(session, final_text)
+            session.add_message("user", final_text)
+            session.add_message("assistant", say_text)
+
+            audio_filename = f"{call_id}_{len(session.messages)}"
+            audio_path = synthesize_speech(say_text, audio_filename)
+            audio_url = f"{rt.ENV.URL}/audio/{os.path.basename(audio_path)}"
+            PREPARED_AUDIO_URL[call_id] = audio_url
+
+        await websocket.close()
+
 
 
 @app.post("/twilio/hangup")
@@ -282,9 +344,11 @@ from pyngrok import ngrok, conf
 
 conf.get_default().auth_token = rt.NGROK_AUTHTOKEN
 
-public_url = ngrok.connect(8000).public_url
-rt.ENV.URL = public_url  # ensure runtime consistency
+public_tunnel = ngrok.connect(8000, bind_tls=True)
+public_url = public_tunnel.public_url
+ws_url = public_url.replace("https", "wss")
+rt.ENV.URL = public_url
 
 print(f"[NGROK] Public URL: {public_url}")
-print(f"Set this as your Twilio webhook:")
+print(f"Set this as the Twilio webhook:")
 print(f"  {public_url}/twilio/voice\n")
